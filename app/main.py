@@ -83,8 +83,9 @@ async def stream_file(file_id: str, file_name: str, request: Request):
         bot = bot_app.bot
         
         # 1. Retrieve the file path from Telegram Bot API
+        # Increase read_timeout to 1800s (30 mins) to allow local Bot API to download large files
         logger.info(f"Retrieving Telegram file metadata for ID: {file_id}")
-        file_obj = await bot.get_file(file_id)
+        file_obj = await bot.get_file(file_id, read_timeout=1800)
         telegram_file_url = file_obj.file_path
         
         if not telegram_file_url:

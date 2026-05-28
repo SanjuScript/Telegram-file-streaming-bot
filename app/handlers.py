@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from urllib.parse import quote
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -144,6 +145,10 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         await message.reply_text("⚠️ Unsupported media type. Please send a video, document, or audio file.")
         return
+
+    # Trigger background download on the local Bot API server immediately so it starts caching
+    logger.info(f"Preemptively triggering background download on local Bot API for ID: {file_id}")
+    asyncio.create_task(context.bot.get_file(file_id, read_timeout=1800))
 
     file_size_mb = file_size_bytes / (1024 * 1024)
     logger.info(f"Generating stream link for {media_type}: '{file_name}' ({file_size_mb:.2f} MB) for User ID: {user.id}")
