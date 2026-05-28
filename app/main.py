@@ -11,7 +11,9 @@ from fastapi.responses import StreamingResponse, FileResponse
 from telegram.ext import CommandHandler, MessageHandler, filters
 
 from app.config import Config
-from app.telegram_utils import get_telegram_app
+from app.telegram_utils import get_telegram_app, get_telethon_client
+from telethon.utils import resolve_bot_file_id
+import re
 from app.handlers import (
     start_handler, 
     help_handler, 
@@ -33,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 # Initialize bot app
 bot_app = get_telegram_app()
+
+# Initialize Telethon client
+telethon_client = get_telethon_client()
 
 # Register bot command handlers
 bot_app.add_handler(CommandHandler("start", start_handler))
@@ -114,7 +119,15 @@ async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(cleanup_old_files_loop())
     logger.info("Disk space-saving auto-cleanup background task started.")
     
+    logger.info("Starting Telethon client...")
+    await telethon_client.start(bot_token=Config.BOT_TOKEN)
+    logger.info("Telethon client started successfully.")
+    
     yield  # FastAPI runs during this yield block
+    
+    logger.info("Shutting down: disconnecting Telethon client...")
+    await telethon_client.disconnect()
+    logger.info("Telethon client disconnected.")
     
     logger.info("Shutting down: canceling background cleanup task...")
     cleanup_task.cancel()
@@ -150,15 +163,22 @@ async def root():
     }
 
 @app.get("/stream/{file_id}/{file_name}")
-async def stream_file(file_id: str, file_name: str, request: Request, expires: int = None, sig: str = None):
+async def stream_file(
+    file_id: str, 
+    file_name: str, 
+    request: Request, 
+    expires: int = None, 
+    sig: str = None,
+    size: int = None
+):
     """
-    Secure signed range-aware proxy streaming endpoint.
-    Enforces expiration limits (3.5 hours) and validates SHA-256 links signatures.
+    Secure signed proxy streaming endpoint directly connected to Telegram MTProto.
+    Supports instant seeking via byte Range Requests without local disk downloads.
     """
     # 0. Cryptographic security check
-    if expires is None or sig is None:
-        logger.warning(f"Rejected unsigned stream request for file ID: {file_id}")
-        raise HTTPException(status_code=403, detail="Access Denied: Unsigned streaming link.")
+    if expires is None or sig is None or size is None:
+        logger.warning(f"Rejected unsigned or incomplete stream request for file ID: {file_id}")
+        raise HTTPException(status_code=403, detail="Access Denied: Unsigned or incomplete streaming link.")
         
     # Check link expiration status (valid for 3 hours 30 mins)
     current_time = int(time.time())
@@ -166,111 +186,123 @@ async def stream_file(file_id: str, file_name: str, request: Request, expires: i
         logger.warning(f"Rejected expired stream request for file ID: {file_id} (expired {current_time - expires}s ago)")
         raise HTTPException(
             status_code=410, 
-            detail="This streaming link has expired (valid for 3 hours and 30 minutes). Please generate a new link in the bot."
+            detail="This streaming link has expired. Please generate a new link in the bot."
         )
         
-    # Validate HMAC signature using bot token
-    sig_payload = f"{file_id}:{expires}:{Config.BOT_TOKEN}"
+    # Validate HMAC signature using bot token and size
+    sig_payload = f"{file_id}:{expires}:{size}:{Config.BOT_TOKEN}"
     expected_sig = hashlib.sha256(sig_payload.encode()).hexdigest()[:16]
     if sig != expected_sig:
         logger.warning(f"Rejected invalid signature request for file ID: {file_id}")
         raise HTTPException(status_code=403, detail="Access Denied: Invalid cryptographic signature.")
 
     try:
-        bot = bot_app.bot
-        
-        # 1. Retrieve the file path from Telegram Bot API (using 30-min read timeout for downloading)
-        logger.info(f"Retrieving Telegram file metadata for ID: {file_id}")
-        file_obj = await bot.get_file(file_id, read_timeout=1800)
-        telegram_file_url = file_obj.file_path
-        
-        if not telegram_file_url:
-            logger.error(f"Could not retrieve file path for ID: {file_id}")
-            raise HTTPException(status_code=404, detail="File path not found on Telegram servers.")
-            
-        # 1.1 If it's a local file path (local mode)
-        if not telegram_file_url.startswith(("http://", "https://")):
-            if os.path.exists(telegram_file_url):
-                logger.info(f"Streaming local file directly from disk: {telegram_file_url}")
-                # FileResponse in FastAPI automatically handles HTTP Range requests and seeking!
-                return FileResponse(
-                    telegram_file_url,
-                    media_type=None,  # Automatically detect mime type
-                    filename=file_name
-                )
-            else:
-                logger.error(f"Local file path does not exist inside bot container: {telegram_file_url}")
-                raise HTTPException(
-                    status_code=404, 
-                    detail="Local file path not found. Please ensure the volume is mounted correctly at /var/lib/telegram-bot-api."
-                )
-
-        logger.debug(f"Resolved Telegram download URL: {telegram_file_url}")
-        
-        # 2. Extract and forward Range headers from client
-        headers = {}
-        if "range" in request.headers:
-            headers["Range"] = request.headers["range"]
-            logger.info(f"Forwarding Range Header: {headers['Range']}")
-            
-        # 3. Create HTTP client with no timeout for streaming large media files
-        client = httpx.AsyncClient(timeout=None)
-        req = client.build_request("GET", telegram_file_url, headers=headers)
-        
+        # 1. Resolve Bot API file ID to Telethon InputDocument
+        logger.info(f"Resolving Telethon media object for Bot API file ID: {file_id}")
         try:
-            resp = await client.send(req, stream=True)
-        except Exception as e:
-            await client.aclose()
-            logger.error(f"Failed to connect to Telegram file server: {e}")
-            raise HTTPException(status_code=502, detail="Error communicating with Telegram storage servers.")
+            media = resolve_bot_file_id(file_id)
+        except Exception as resolve_err:
+            logger.error(f"Failed to resolve file ID in Telethon: {resolve_err}")
+            raise HTTPException(status_code=400, detail="Invalid file ID structure.")
             
-        status_code = resp.status_code
-        logger.info(f"Telegram server responded with status code: {status_code}")
+        if not media:
+            raise HTTPException(status_code=404, detail="Media object could not be resolved.")
+
+        # 2. Parse Range Header
+        start = 0
+        end = size - 1
+        is_range_request = False
         
+        range_header = request.headers.get("range")
+        if range_header:
+            match = re.match(r"bytes=(\d+)-(\d+)?", range_header)
+            if match:
+                is_range_request = True
+                start = int(match.group(1))
+                if match.group(2):
+                    end = int(match.group(2))
+                    
+        # Clamp ranges
+        if start >= size:
+            raise HTTPException(status_code=416, detail=f"Requested range not satisfiable (start {start} >= size {size})")
+        if end >= size:
+            end = size - 1
+
+        length_to_read = end - start + 1
+        
+        # 3. Telethon requires offsets to be multiples of 4 KB (4096 bytes)
+        aligned_offset = (start // 4096) * 4096
+        skip_bytes = start - aligned_offset
+        
+        logger.info(f"Stream request range: {start}-{end}/{size} (Range request: {is_range_request}). Aligned offset: {aligned_offset}, Skip: {skip_bytes} bytes.")
+
         # 4. Prepare response headers
         response_headers = {
-            "Content-Type": resp.headers.get("Content-Type", "video/mp4"),
+            "Content-Type": "video/mp4",
             "Accept-Ranges": "bytes",
+            "Content-Disposition": f'inline; filename="{file_name}"',
         }
         
-        # Forward relevant headers from Telegram response
-        if "Content-Range" in resp.headers:
-            response_headers["Content-Range"] = resp.headers["Content-Range"]
-        if "Content-Length" in resp.headers:
-            response_headers["Content-Length"] = resp.headers["Content-Length"]
-        if "Content-Disposition" in resp.headers:
-            response_headers["Content-Disposition"] = resp.headers["Content-Disposition"]
+        status_code = 200
+        if is_range_request:
+            status_code = 206
+            response_headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+            response_headers["Content-Length"] = str(length_to_read)
         else:
-            response_headers["Content-Disposition"] = f'inline; filename="{file_name}"'
+            response_headers["Content-Length"] = str(size)
 
         # 5. Define asynchronous stream generator
-        async def stream_generator():
+        async def stream_generator(start_offset: int, skip_initial_bytes: int, total_bytes_to_read: int):
+            chunk_size = 1024 * 1024  # 1MB chunks for high-throughput streaming
+            bytes_sent = 0
+            skip_remaining = skip_initial_bytes
+            
             try:
-                # 128KB buffer size is optimized for smooth network streaming
-                async for chunk in resp.aiter_bytes(chunk_size=131072):
-                    yield chunk
+                # iter_download streams chunks from Telegram DC
+                async for chunk in telethon_client.iter_download(
+                    media,
+                    offset=start_offset,
+                    request_size=chunk_size,
+                    limit=None
+                ):
+                    if not chunk:
+                        break
+                        
+                    # Handle unaligned offset by skipping initial bytes in the first chunk
+                    if skip_remaining > 0:
+                        if len(chunk) <= skip_remaining:
+                            skip_remaining -= len(chunk)
+                            continue
+                        else:
+                            chunk = chunk[skip_remaining:]
+                            skip_remaining = 0
+                            
+                    # Slice chunk to fit the requested range limit
+                    if bytes_sent + len(chunk) > total_bytes_to_read:
+                        chunk = chunk[:(total_bytes_to_read - bytes_sent)]
+                        
+                    if len(chunk) > 0:
+                        yield chunk
+                        bytes_sent += len(chunk)
+                        
+                    if bytes_sent >= total_bytes_to_read:
+                        break
             except Exception as stream_err:
-                logger.error(f"Network stream interrupted during file download: {stream_err}")
+                logger.error(f"MTProto streaming interrupted: {stream_err}")
             finally:
-                await resp.aclose()
-                await client.aclose()
-                logger.info("Closed streaming network client connections.")
+                logger.debug(f"Streaming finished. Sent {bytes_sent} bytes to client.")
 
         return StreamingResponse(
-            stream_generator(),
+            stream_generator(aligned_offset, skip_bytes, length_to_read),
             status_code=status_code,
             headers=response_headers
         )
         
+    except HTTPException as http_ex:
+        raise http_ex
     except Exception as err:
-        logger.error(f"Stream handler error: {err}", exc_info=True)
-        err_msg = str(err)
-        if "File is too big" in err_msg:
-            raise HTTPException(
-                status_code=413, 
-                detail="File is too big. Standard Telegram Bot API limit is 20MB. Please host a local Bot API Server to stream files up to 2GB."
-            )
-        raise HTTPException(status_code=500, detail=f"Internal proxy server exception: {err_msg}")
+        logger.error(f"Stream handler exception: {err}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal proxy server exception: {str(err)}")
 
 if __name__ == "__main__":
     logger.info(f"Starting server on {Config.HOST}:{Config.PORT}...")

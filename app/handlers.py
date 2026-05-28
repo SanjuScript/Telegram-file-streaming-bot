@@ -301,68 +301,35 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     file_size_mb = file_size_bytes / (1024 * 1024)
     logger.info(f"Generating stream link for {media_type}: '{file_name}' ({file_size_mb:.2f} MB) for User ID: {user.id}")
 
-    # Trigger background download on the local Bot API server immediately so it starts caching
-    logger.info(f"Preemptively triggering background download on local Bot API for ID: {file_id}")
-    asyncio.create_task(context.bot.get_file(file_id, read_timeout=1800))
-
-    # Send initial status message to user
-    status_message = await message.reply_text(
-        "⏳ *Initiating file caching on local server... Please wait 10 seconds.*",
-        parse_mode="Markdown"
-    )
-
-    # Countdown loop (total 10 seconds) to give the local Bot API server a head-start
-    for seconds_left in [8, 6, 4, 2]:
-        await asyncio.sleep(2)
-        try:
-            await status_message.edit_text(
-                f"⏳ *Caching file on the local server... Please wait {seconds_left} seconds.*",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-    # Final sleep to reach exactly 10s
-    await asyncio.sleep(2)
-
-    # Send a Success animated sticker after caching wait finishes
-    await send_animated_sticker(chat_id, "success", context)
-
     # Calculate expiration: 3 hours and 30 minutes (12600 seconds)
     expires = int(time.time()) + 12600
     
-    # Generate cryptographic signature using the BOT_TOKEN as secret
-    sig_payload = f"{file_id}:{expires}:{Config.BOT_TOKEN}"
+    # Generate cryptographic signature using the BOT_TOKEN as secret, including the file size in bytes
+    sig_payload = f"{file_id}:{expires}:{file_size_bytes}:{Config.BOT_TOKEN}"
     signature = hashlib.sha256(sig_payload.encode()).hexdigest()[:16]
 
     # Create URL-safe file name
     safe_file_name = quote(file_name)
     
-    # Construct Secure Signed Proxy Stream URL
-    secure_url = f"{Config.SERVER_URL}/stream/{file_id}/{safe_file_name}?expires={expires}&sig={signature}"
+    # Construct Secure Signed Proxy Stream URL with size parameter
+    secure_url = f"{Config.SERVER_URL}/stream/{file_id}/{safe_file_name}?expires={expires}&sig={signature}&size={file_size_bytes}"
     
-    # Warn user about files > 20MB if custom base URL is not set
-    size_warning = ""
-    if file_size_mb > 20.0 and not Config.TELEGRAM_BASE_URL:
-        size_warning = (
-            "\n⚠️ *Notice:* This file is larger than 20MB. Since a local Telegram Bot API Server is "
-            "not configured in this bot, streaming might fail due to standard Telegram Bot API limitations.\n"
-        )
+    # Send a Success animated sticker immediately
+    await send_animated_sticker(chat_id, "success", context)
 
     # Update stats and logs history
     total_generated = Config.increment_links()
     Config.add_request_log(user.id)
 
-    # Respond to the requesting user by editing the status message with streaming details & inline buttons
+    # Respond to the requesting user with streaming details & inline buttons
     response_msg = (
         f"🎬 **Stream Links Generated!**\n\n"
         f"📁 **File:** `{file_name}`\n"
         f"📊 **Size:** `{file_size_mb:.2f} MB`\n"
-        f"🏷️ **Type:** `{media_type}`\n"
-        f"{size_warning}\n"
+        f"🏷️ **Type:** `{media_type}`\n\n"
         f"🔒 **Secure Stream URL** (tap to copy):\n"
         f"`{secure_url}`\n\n"
-        f"⏳ *Notice: For larger files, it may take 1 to 2 minutes for the video to load or play "
-        f"while the server completes downloading it in the background. If it fails or buffers, please wait a moment and try again.*\n\n"
+        f"⏳ *Notice: This link supports instant on-demand streaming. You can seek or scrub to any part of the video immediately without waiting for downloads.*\n\n"
         f"⏰ *Note: This link will expire after 3 hours and 30 minutes.*\n"
         f"👨‍💻 *Developer:* **Sanju**"
     )
@@ -371,11 +338,7 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         [InlineKeyboardButton("💬 Chat With Developer", url=f"tg://user?id={Config.OWNER_ID}")]
     ])
     
-    try:
-        await status_message.edit_text(response_msg, parse_mode="Markdown", reply_markup=keyboard)
-    except Exception:
-        # Fallback to sending a new message if editing fails for any reason
-        await message.reply_text(response_msg, parse_mode="Markdown", reply_markup=keyboard)
+    await message.reply_text(response_msg, parse_mode="Markdown", reply_markup=keyboard)
 
     # If another user makes the request, notify the developer (owner)
     if user.id != Config.OWNER_ID:

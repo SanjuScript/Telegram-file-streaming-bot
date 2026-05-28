@@ -1,8 +1,23 @@
+import os
 import logging
 from telegram.ext import Application, ApplicationBuilder
+from telethon import TelegramClient
 from app.config import Config
 
 logger = logging.getLogger(__name__)
+
+def get_telethon_client() -> TelegramClient:
+    """
+    Build and return the Telethon TelegramClient instance logged in as a Bot.
+    Session is stored persistently in the data directory.
+    """
+    session_path = os.path.join(Config.DATA_DIR, "telethon_session")
+    logger.info(f"Initializing Telethon TelegramClient at session path: {session_path}")
+    return TelegramClient(
+        session_path,
+        Config.API_ID,
+        Config.API_HASH
+    )
 
 def get_telegram_app() -> Application:
     """

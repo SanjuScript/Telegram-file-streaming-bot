@@ -52,6 +52,10 @@ class Config:
         raise ValueError("TELEGRAM_BOT_TOKEN must be set in environment or .env file.")
         
     OWNER_ID = int(os.getenv("OWNER_ID", "1948015235"))
+    
+    # Telethon MTProto credentials
+    API_ID = int(os.getenv("API_ID", "30915176"))
+    API_HASH = os.getenv("API_HASH", "6bdd3f6dbec3acbd6a55178ea21f397e")
         
     # Allowed users - comma separated list of user IDs or usernames (without @)
     # e.g., ALLOWED_USERS=12345678,sanju_script
