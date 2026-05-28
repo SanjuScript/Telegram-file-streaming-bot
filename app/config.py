@@ -19,11 +19,22 @@ def load_settings():
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+                # Ensure structure is upgraded with new keys
+                if "favorites" not in data:
+                    data["favorites"] = []
+                if "history" not in data:
+                    data["history"] = []
+                return data
         except Exception as e:
             logger.error(f"Error loading settings file: {e}")
     # Default settings
-    return {"private_mode": True, "total_links_generated": 0}
+    return {
+        "private_mode": True, 
+        "total_links_generated": 0,
+        "favorites": [],
+        "history": []
+    }
 
 def save_settings(settings):
     """Save settings to settings.json file."""
@@ -66,6 +77,9 @@ class Config:
     TELEGRAM_BASE_FILE_URL = os.getenv("TELEGRAM_BASE_FILE_URL")
     TELEGRAM_LOCAL_MODE = os.getenv("TELEGRAM_LOCAL_MODE", "true").lower() in ("true", "1", "yes")
 
+    # Local Bot API Server cache storage path on Xubuntu
+    TELEGRAM_FILES_DIR = f"/var/lib/telegram-bot-api/bot{BOT_TOKEN}"
+
     # App Log Level
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
@@ -98,3 +112,69 @@ class Config:
         settings["total_links_generated"] = new_val
         save_settings(settings)
         return new_val
+
+    @classmethod
+    def get_favorites(cls) -> list[int]:
+        """Get list of Telegram User IDs present in the favorites list."""
+        settings = load_settings()
+        return settings.get("favorites", [])
+
+    @classmethod
+    def add_favorite(cls, user_id: int) -> bool:
+        """Add a User ID to the favorites list. Returns True if added, False if already exists."""
+        settings = load_settings()
+        favorites = settings.setdefault("favorites", [])
+        if user_id not in favorites:
+            favorites.append(user_id)
+            save_settings(settings)
+            return True
+        return False
+
+    @classmethod
+    def remove_favorite(cls, user_id: int) -> bool:
+        """Remove a User ID from the favorites list. Returns True if removed, False if not found."""
+        settings = load_settings()
+        favorites = settings.setdefault("favorites", [])
+        if user_id in favorites:
+            favorites.remove(user_id)
+            save_settings(settings)
+            return True
+        return False
+
+    @classmethod
+    def add_request_log(cls, user_id: int) -> None:
+        """Log a stream link request timestamp for analytics, automatically purging logs older than 30 days."""
+        import time
+        settings = load_settings()
+        history = settings.setdefault("history", [])
+        
+        # Append current request details
+        history.append({
+            "timestamp": int(time.time()),
+            "user_id": user_id
+        })
+        
+        # Purge logs older than 30 days to limit settings.json size growth
+        thirty_days_ago = int(time.time()) - 2592000
+        settings["history"] = [entry for entry in history if entry.get("timestamp", 0) > thirty_days_ago]
+        
+        save_settings(settings)
+
+    @classmethod
+    def get_weekly_analytics(cls) -> dict:
+        """Get the count of files generated in the last 24 hours and the last 7 days (weekly stats)."""
+        import time
+        settings = load_settings()
+        history = settings.get("history", [])
+        now = int(time.time())
+        
+        one_day_ago = now - 86400
+        seven_days_ago = now - 604800
+        
+        links_24h = sum(1 for entry in history if entry.get("timestamp", 0) > one_day_ago)
+        links_7d = sum(1 for entry in history if entry.get("timestamp", 0) > seven_days_ago)
+        
+        return {
+            "links_24h": links_24h,
+            "links_7d": links_7d
+        }

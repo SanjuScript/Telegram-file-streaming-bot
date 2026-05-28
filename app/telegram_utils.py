@@ -29,20 +29,28 @@ def is_user_allowed(user_id: int, username: str = None) -> bool:
     """
     Check if the user is authorized to use the bot.
     - Owner (Config.OWNER_ID) is ALWAYS allowed.
-    - If private mode is True, only allow the Owner and any users configured in ALLOWED_USERS.
+    - If private mode is True, only allow:
+      1. The Owner/Developer.
+      2. Any User ID present in the favorites list.
+      3. Any User ID/username configured in ALLOWED_USERS.
     - If private mode is False (Public), allow everyone.
     """
-    # 1. Owner is always allowed
+    # 1. Owner/Developer is always allowed
     if user_id == Config.OWNER_ID:
         return True
 
-    # 2. Check if private mode is enabled
+    # 2. Check if private/restricted mode is active
     if Config.get_private_mode():
-        # Only allow explicitly authorized users
+        # Check if user is in favorites list
+        if user_id in Config.get_favorites():
+            return True
+            
+        # Check if user is in environment ALLOWED_USERS
         if user_id in Config.ALLOWED_USERS:
             return True
         if username and username.lower() in Config.ALLOWED_USERS:
             return True
+            
         return False
 
     # 3. If in public mode, allow everyone
