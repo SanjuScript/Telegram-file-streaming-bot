@@ -5,3 +5,4 @@ httpx>=0.24.0
 python-dotenv>=1.0.0
 telethon>=1.30.0
 cryptg>=0.4.0
+tg-file-id>=0.0.4

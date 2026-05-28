@@ -12,7 +12,8 @@ from telegram.ext import CommandHandler, MessageHandler, filters
 
 from app.config import Config
 from app.telegram_utils import get_telegram_app, get_telethon_client
-from telethon.utils import resolve_bot_file_id
+from tg_file_id.file_id import FileId
+from telethon.tl.types import Document, DocumentAttributeVideo
 import re
 from app.handlers import (
     start_handler, 
@@ -32,6 +33,17 @@ logging.basicConfig(
     level=getattr(logging, Config.LOG_LEVEL)
 )
 logger = logging.getLogger(__name__)
+
+# Monkeypatch tg-file-id to support all version 4 sub-versions
+def custom_parse_version(cls, decoded: bytearray):
+    data, version = decoded[:-1], decoded[-1]
+    if version == 4:
+        data, sub_version = data[:-1], data[-1]
+    else:
+        sub_version = 0
+    return data, version, sub_version
+
+FileId._parse_version = classmethod(custom_parse_version)
 
 # Initialize bot app
 bot_app = get_telegram_app()
@@ -197,16 +209,33 @@ async def stream_file(
         raise HTTPException(status_code=403, detail="Access Denied: Invalid cryptographic signature.")
 
     try:
-        # 1. Resolve Bot API file ID to Telethon InputDocument
+        # 1. Resolve Bot API file ID to Telethon Document manually
         logger.info(f"Resolving Telethon media object for Bot API file ID: {file_id}")
         try:
-            media = resolve_bot_file_id(file_id)
+            decoded = FileId.from_file_id(file_id)
+            if not decoded:
+                raise ValueError("Parsed result is empty.")
         except Exception as resolve_err:
-            logger.error(f"Failed to resolve file ID in Telethon: {resolve_err}")
+            logger.error(f"Failed to resolve file ID: {resolve_err}")
             raise HTTPException(status_code=400, detail="Invalid file ID structure.")
             
-        if not media:
-            raise HTTPException(status_code=404, detail="Media object could not be resolved.")
+        media = Document(
+            id=decoded.id,
+            access_hash=decoded.access_hash,
+            file_reference=bytes(decoded.file_reference),
+            date=None,
+            mime_type="video/mp4",
+            size=size,
+            dc_id=decoded.dc_id,
+            thumbs=[],
+            attributes=[
+                DocumentAttributeVideo(
+                    duration=0,
+                    w=0,
+                    h=0
+                )
+            ]
+        )
 
         # 2. Parse Range Header
         start = 0
