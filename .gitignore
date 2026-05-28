@@ -1,0 +1,17 @@
+# Python virtual environments
+venv/
+.venv/
+env/
+
+# Python compiled bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment configuration (Contains sensitive bot token!)
+.env
+
+# Local runtime data settings
+data/settings.json
+data/
