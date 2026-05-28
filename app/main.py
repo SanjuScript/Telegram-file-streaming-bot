@@ -1,9 +1,10 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from telegram.ext import CommandHandler, MessageHandler, filters
 
 from app.config import Config
@@ -92,6 +93,23 @@ async def stream_file(file_id: str, file_name: str, request: Request):
             logger.error(f"Could not retrieve file path for ID: {file_id}")
             raise HTTPException(status_code=404, detail="File path not found on Telegram servers.")
             
+        # 1.1 If it's a local file path (local mode)
+        if not telegram_file_url.startswith(("http://", "https://")):
+            if os.path.exists(telegram_file_url):
+                logger.info(f"Streaming local file directly from disk: {telegram_file_url}")
+                # FileResponse in FastAPI automatically handles HTTP Range requests and seeking!
+                return FileResponse(
+                    telegram_file_url,
+                    media_type=None,  # Automatically detect mime type
+                    filename=file_name
+                )
+            else:
+                logger.error(f"Local file path does not exist inside bot container: {telegram_file_url}")
+                raise HTTPException(
+                    status_code=404, 
+                    detail="Local file path not found. Please ensure the volume is mounted correctly at /var/lib/telegram-bot-api."
+                )
+
         logger.debug(f"Resolved Telegram download URL: {telegram_file_url}")
         
         # 2. Extract and forward Range headers from client

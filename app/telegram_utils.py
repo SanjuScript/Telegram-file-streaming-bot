@@ -18,6 +18,11 @@ def get_telegram_app() -> Application:
         logger.info(f"Using custom Telegram Base File URL: {Config.TELEGRAM_BASE_FILE_URL}")
         builder.base_file_url(Config.TELEGRAM_BASE_FILE_URL)
         
+    # Enable local mode if bot runs on the same machine/shared filesystem as local Bot API Server
+    if Config.TELEGRAM_BASE_URL and Config.TELEGRAM_LOCAL_MODE:
+        logger.info("Enabling local mode for file path retrieval.")
+        builder.local_mode(True)
+        
     return builder.build()
 
 def is_user_allowed(user_id: int, username: str = None) -> bool:

@@ -64,6 +64,7 @@ class Config:
     # Local Telegram Bot API Server configurations (optional)
     TELEGRAM_BASE_URL = os.getenv("TELEGRAM_BASE_URL")
     TELEGRAM_BASE_FILE_URL = os.getenv("TELEGRAM_BASE_FILE_URL")
+    TELEGRAM_LOCAL_MODE = os.getenv("TELEGRAM_LOCAL_MODE", "true").lower() in ("true", "1", "yes")
 
     # App Log Level
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
