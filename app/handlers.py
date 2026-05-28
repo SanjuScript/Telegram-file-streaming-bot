@@ -305,7 +305,26 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.info(f"Preemptively triggering background download on local Bot API for ID: {file_id}")
     asyncio.create_task(context.bot.get_file(file_id, read_timeout=1800))
 
-    # Send a Success animated sticker
+    # Send initial status message to user
+    status_message = await message.reply_text(
+        "⏳ *Initiating file caching on local server... Please wait 10 seconds.*",
+        parse_mode="Markdown"
+    )
+
+    # Countdown loop (total 10 seconds) to give the local Bot API server a head-start
+    for seconds_left in [8, 6, 4, 2]:
+        await asyncio.sleep(2)
+        try:
+            await status_message.edit_text(
+                f"⏳ *Caching file on the local server... Please wait {seconds_left} seconds.*",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+    # Final sleep to reach exactly 10s
+    await asyncio.sleep(2)
+
+    # Send a Success animated sticker after caching wait finishes
     await send_animated_sticker(chat_id, "success", context)
 
     # Calculate expiration: 3 hours and 30 minutes (12600 seconds)
@@ -333,7 +352,7 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     total_generated = Config.increment_links()
     Config.add_request_log(user.id)
 
-    # Respond to the requesting user with streaming details & inline buttons
+    # Respond to the requesting user by editing the status message with streaming details & inline buttons
     response_msg = (
         f"🎬 **Stream Links Generated!**\n\n"
         f"📁 **File:** `{file_name}`\n"
@@ -342,16 +361,21 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"{size_warning}\n"
         f"🔒 **Secure Stream URL** (tap to copy):\n"
         f"`{secure_url}`\n\n"
+        f"⏳ *Notice: For larger files, it may take 1 to 2 minutes for the video to load or play "
+        f"while the server completes downloading it in the background. If it fails or buffers, please wait a moment and try again.*\n\n"
         f"⏰ *Note: This link will expire after 3 hours and 30 minutes.*\n"
         f"👨‍💻 *Developer:* **Sanju**"
     )
     
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎬 Open Stream", url=secure_url)],
         [InlineKeyboardButton("💬 Chat With Developer", url=f"tg://user?id={Config.OWNER_ID}")]
     ])
     
-    await message.reply_text(response_msg, parse_mode="Markdown", reply_markup=keyboard)
+    try:
+        await status_message.edit_text(response_msg, parse_mode="Markdown", reply_markup=keyboard)
+    except Exception:
+        # Fallback to sending a new message if editing fails for any reason
+        await message.reply_text(response_msg, parse_mode="Markdown", reply_markup=keyboard)
 
     # If another user makes the request, notify the developer (owner)
     if user.id != Config.OWNER_ID:
