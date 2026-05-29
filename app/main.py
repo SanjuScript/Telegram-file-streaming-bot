@@ -1,4 +1,5 @@
 import logging
+import mimetypes
 import os
 import time
 import hashlib
@@ -219,12 +220,15 @@ async def stream_file(
             logger.error(f"Failed to resolve file ID: {resolve_err}")
             raise HTTPException(status_code=400, detail="Invalid file ID structure.")
             
+        # Detect correct MIME type from file extension (critical for MKV subtitle tracks)
+        content_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+
         media = Document(
             id=decoded.id,
             access_hash=decoded.access_hash,
             file_reference=bytes(decoded.file_reference),
             date=None,
-            mime_type="video/mp4",
+            mime_type=content_type,
             size=size,
             dc_id=decoded.dc_id,
             thumbs=[],
@@ -267,7 +271,7 @@ async def stream_file(
 
         # 4. Prepare response headers
         response_headers = {
-            "Content-Type": "video/mp4",
+            "Content-Type": content_type,
             "Accept-Ranges": "bytes",
             "Content-Disposition": f'inline; filename="{file_name}"',
         }
