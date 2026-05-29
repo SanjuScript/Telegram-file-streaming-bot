@@ -311,7 +311,10 @@ async def stream_file(
                         chunk = chunk[:(total_bytes_to_read - bytes_sent)]
                         
                     if len(chunk) > 0:
-                        yield chunk
+                        # Yield in 64KB chunks to maintain a smooth ASGI stream
+                        sub_chunk_size = 64 * 1024
+                        for i in range(0, len(chunk), sub_chunk_size):
+                            yield chunk[i:i+sub_chunk_size]
                         bytes_sent += len(chunk)
                         
                     if bytes_sent >= total_bytes_to_read:
