@@ -283,18 +283,34 @@ async def stream_file(
         # 5. Define asynchronous stream generator
         async def stream_generator(start_offset: int, skip_initial_bytes: int, total_bytes_to_read: int):
             chunk_size = 1024 * 1024  # 1MB chunks for high-throughput streaming
+            queue = asyncio.Queue(maxsize=20)  # Read-ahead buffer up to 20MB
+            
+            async def download_task():
+                try:
+                    # iter_download streams chunks from Telegram DC
+                    async for chunk in telethon_client.iter_download(
+                        media, offset=start_offset, request_size=chunk_size, limit=None
+                    ):
+                        if not chunk:
+                            break
+                        await queue.put(chunk)
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"Downloader task error: {e}")
+                finally:
+                    await queue.put(None)  # Sentinel to end
+
+            # Start downloader in background
+            task = asyncio.create_task(download_task())
+            
             bytes_sent = 0
             skip_remaining = skip_initial_bytes
             
             try:
-                # iter_download streams chunks from Telegram DC
-                async for chunk in telethon_client.iter_download(
-                    media,
-                    offset=start_offset,
-                    request_size=chunk_size,
-                    limit=None
-                ):
-                    if not chunk:
+                while True:
+                    chunk = await queue.get()
+                    if chunk is None:  # Sentinel reached
                         break
                         
                     # Handle unaligned offset by skipping initial bytes in the first chunk
@@ -322,6 +338,7 @@ async def stream_file(
             except Exception as stream_err:
                 logger.error(f"MTProto streaming interrupted: {stream_err}")
             finally:
+                task.cancel()  # Ensure background downloader stops when client disconnects
                 logger.debug(f"Streaming finished. Sent {bytes_sent} bytes to client.")
 
         return StreamingResponse(
