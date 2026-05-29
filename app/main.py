@@ -295,25 +295,46 @@ async def stream_file(
             queues = [asyncio.Queue(maxsize=QUEUE_SIZE) for _ in range(NUM_WORKERS)]
 
             async def download_worker(worker_id):
-                """Long-lived download stream. Uses stride to interleave with other workers."""
-                worker_offset = start_offset + worker_id * CHUNK_SIZE
-                try:
-                    async for chunk in telethon_client.iter_download(
-                        media,
-                        offset=worker_offset,
-                        request_size=CHUNK_SIZE,
-                        stride=STRIDE,
-                        file_size=size
-                    ):
-                        if not chunk:
-                            break
-                        await queues[worker_id].put(chunk)
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.error(f"Download worker {worker_id} error: {e}")
-                finally:
-                    await queues[worker_id].put(None)  # End sentinel
+                """Long-lived download stream with auto-retry on connection drops."""
+                current_offset = start_offset + worker_id * CHUNK_SIZE
+                max_retries = 5
+                retries = 0
+
+                while retries < max_retries:
+                    try:
+                        logger.debug(f"Worker {worker_id} starting download at offset {current_offset}")
+                        async for chunk in telethon_client.iter_download(
+                            media,
+                            offset=current_offset,
+                            request_size=CHUNK_SIZE,
+                            stride=STRIDE,
+                            file_size=size
+                        ):
+                            if not chunk:
+                                break
+                            await queues[worker_id].put(chunk)
+                            current_offset += STRIDE  # Track progress for resume
+                            retries = 0  # Reset on success
+
+                        # Check if we actually finished the file
+                        if current_offset >= size:
+                            break  # Done — normal completion
+
+                        # Premature exit — connection likely dropped
+                        retries += 1
+                        logger.warning(f"Worker {worker_id} stream ended prematurely at offset {current_offset}/{size}. Retry {retries}/{max_retries}...")
+                        await asyncio.sleep(2)
+
+                    except asyncio.CancelledError:
+                        return  # Client disconnected — stop cleanly
+                    except Exception as e:
+                        retries += 1
+                        logger.error(f"Worker {worker_id} error at offset {current_offset}: {e}. Retry {retries}/{max_retries}...")
+                        await asyncio.sleep(2)
+
+                if retries >= max_retries:
+                    logger.error(f"Worker {worker_id} exhausted all {max_retries} retries. Stream incomplete.")
+                await queues[worker_id].put(None)  # End sentinel
 
             # Launch 2 persistent download streams
             workers = [asyncio.create_task(download_worker(i)) for i in range(NUM_WORKERS)]
