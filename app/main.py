@@ -280,96 +280,81 @@ async def stream_file(
         else:
             response_headers["Content-Length"] = str(size)
 
-        # 5. Parallel streaming engine — 8 concurrent download workers with ordered read-ahead buffer
+        # 5. Dual-stream interleaved engine — 2 long-lived connections with stride-based interleaving
         async def stream_generator(start_offset: int, skip_initial_bytes: int, total_bytes_to_read: int):
-            PART_SIZE = 1024 * 1024  # 1MB per download request
-            NUM_WORKERS = 8          # 8 parallel Telegram connections
-            MAX_AHEAD = 24           # Buffer up to 24 parts (24MB) ahead
+            CHUNK_SIZE = 1024 * 1024  # 1MB per chunk read
+            NUM_WORKERS = 2
+            STRIDE = NUM_WORKERS * CHUNK_SIZE  # 2MB stride — each worker reads every other chunk
+            QUEUE_SIZE = 15  # 15 chunks buffered per worker = 30MB total read-ahead
 
-            total_to_download = total_bytes_to_read + skip_initial_bytes
-            total_parts = (total_to_download + PART_SIZE - 1) // PART_SIZE
+            # Each worker gets its own output queue
+            queues = [asyncio.Queue(maxsize=QUEUE_SIZE) for _ in range(NUM_WORKERS)]
 
-            work_queue = asyncio.Queue()
-            result_buffer = {}
-            result_ready = asyncio.Event()
-            buffer_sem = asyncio.Semaphore(MAX_AHEAD)
-
-            # Fill work queue with (part_index, byte_offset) pairs
-            for i in range(total_parts):
-                work_queue.put_nowait((i, start_offset + i * PART_SIZE))
-            # Add stop sentinels for each worker
-            for _ in range(NUM_WORKERS):
-                work_queue.put_nowait(None)
-
-            async def download_worker():
-                """Each worker pulls part assignments and downloads them in parallel."""
-                while True:
-                    try:
-                        item = await work_queue.get()
-                        if item is None:
+            async def download_worker(worker_id):
+                """Long-lived download stream. Uses stride to interleave with other workers."""
+                worker_offset = start_offset + worker_id * CHUNK_SIZE
+                try:
+                    async for chunk in telethon_client.iter_download(
+                        media,
+                        offset=worker_offset,
+                        request_size=CHUNK_SIZE,
+                        stride=STRIDE,
+                        file_size=size
+                    ):
+                        if not chunk:
                             break
-                        part_idx, offset = item
-                        await buffer_sem.acquire()  # Throttle if buffer is full
-                        data = bytearray()
-                        async for chunk in telethon_client.iter_download(
-                            media, offset=offset, request_size=PART_SIZE, limit=PART_SIZE
-                        ):
-                            data.extend(chunk)
-                        result_buffer[part_idx] = bytes(data)
-                        result_ready.set()
-                    except asyncio.CancelledError:
-                        break
-                    except Exception as e:
-                        logger.error(f"Download worker error on part {item[0] if item else '?'}: {e}")
-                        if item:
-                            result_buffer[item[0]] = b""
-                            result_ready.set()
+                        await queues[worker_id].put(chunk)
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"Download worker {worker_id} error: {e}")
+                finally:
+                    await queues[worker_id].put(None)  # End sentinel
 
-            # Launch parallel workers
-            workers = [asyncio.create_task(download_worker()) for _ in range(NUM_WORKERS)]
+            # Launch 2 persistent download streams
+            workers = [asyncio.create_task(download_worker(i)) for i in range(NUM_WORKERS)]
 
             bytes_sent = 0
             skip_remaining = skip_initial_bytes
-            next_part = 0
 
             try:
-                while next_part < total_parts:
-                    # Wait until the next sequential part is ready
-                    while next_part not in result_buffer:
-                        result_ready.clear()
-                        await result_ready.wait()
+                finished = False
+                while not finished:
+                    # Alternate: read from Worker 0, then Worker 1, then Worker 0, ...
+                    for wid in range(NUM_WORKERS):
+                        chunk = await queues[wid].get()
+                        if chunk is None:
+                            finished = True
+                            break
 
-                    chunk = result_buffer.pop(next_part)
-                    buffer_sem.release()  # Free a slot for workers to download more
-                    next_part += 1
+                        # Handle unaligned offset by skipping initial bytes
+                        if skip_remaining > 0:
+                            if len(chunk) <= skip_remaining:
+                                skip_remaining -= len(chunk)
+                                continue
+                            chunk = chunk[skip_remaining:]
+                            skip_remaining = 0
 
-                    # Handle unaligned offset by skipping initial bytes
-                    if skip_remaining > 0:
-                        if len(chunk) <= skip_remaining:
-                            skip_remaining -= len(chunk)
-                            continue
-                        chunk = chunk[skip_remaining:]
-                        skip_remaining = 0
+                        # Clamp to requested range
+                        if bytes_sent + len(chunk) > total_bytes_to_read:
+                            chunk = chunk[:(total_bytes_to_read - bytes_sent)]
 
-                    # Slice chunk to fit the requested range limit
-                    if bytes_sent + len(chunk) > total_bytes_to_read:
-                        chunk = chunk[:(total_bytes_to_read - bytes_sent)]
+                        if len(chunk) > 0:
+                            # Yield in 64KB sub-chunks for smooth ASGI delivery
+                            sub_size = 64 * 1024
+                            for i in range(0, len(chunk), sub_size):
+                                yield chunk[i:i + sub_size]
+                            bytes_sent += len(chunk)
 
-                    if len(chunk) > 0:
-                        # Yield in 64KB sub-chunks for smooth ASGI delivery
-                        sub_size = 64 * 1024
-                        for i in range(0, len(chunk), sub_size):
-                            yield chunk[i:i + sub_size]
-                        bytes_sent += len(chunk)
-
-                    if bytes_sent >= total_bytes_to_read:
-                        break
+                        if bytes_sent >= total_bytes_to_read:
+                            finished = True
+                            break
             except Exception as stream_err:
-                logger.error(f"MTProto streaming interrupted: {stream_err}")
+                logger.error(f"Streaming interrupted: {stream_err}")
             finally:
                 for w in workers:
                     w.cancel()
-                logger.debug(f"Parallel streaming finished. Sent {bytes_sent} bytes via {NUM_WORKERS} workers.")
+                logger.debug(f"Dual-stream finished. Sent {bytes_sent} bytes via {NUM_WORKERS} workers.")
 
         return StreamingResponse(
             stream_generator(aligned_offset, skip_bytes, length_to_read),
