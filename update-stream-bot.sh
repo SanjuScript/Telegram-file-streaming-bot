@@ -21,6 +21,7 @@ docker run -d \
   --env-file .env \
   -v youtube-downloader_telegram-bot-api-data:/var/lib/telegram-bot-api \
   -v "$(pwd)/data:/app/data" \
+  -v "$(pwd)/.env:/app/.env" \
   telegram-stream-bot
 
 echo "📋 Showing logs (Press Ctrl+C to exit logs view)..."
